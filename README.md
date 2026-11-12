@@ -328,6 +328,16 @@ SYSTEM_CLEAN_ITEM=<id>:<结果>:exit=<退出码>:deltaGB=<差值>
 
 > 噪声阈值 `0.05 GB` 尚未经成功清理案例校准：本次退出码非零，差值分支没有走到。保持该值直至有成功样本。
 
+**E_ACCESSDENIED 是什么、怎么重试**：这是 Windows 组件存储的事务提交失败，**不是本工具权限不足**（会话已是管理员，`SYSTEM_CLEAN_PRECHECK=admin=1;exe=1;canRun=1`）。本机后续只读检查：目标 `.cat` 文件仍存在、所有者 `NT SERVICE\TrustedInstaller`、Administrators 仅 `ReadAndExecute`；`SessionsPending` 有残留会话键但 `Exclusive=0`；`RebootPending=false`、`pending.xml` 不存在、无并发 DISM/TiWorker 进程；系统为 26H2 build 26300.9974，卷 `Healthy`。
+
+重试前建议先做这几项只读检查：
+
+- 是否有并发 `Dism` / `TiWorker` 进程；有就等它结束再重试；
+- `CBS.log` 是否还在写入；`SessionsPending` / `RebootPending` / `pending.xml` 的状态；
+- 上一次失败的 `access-denied` 是否仍记在状态文件里。
+
+若以上都干净，可在管理员会话中重试。重试**不会**自动修改 ACL、不会强删 catalog 文件、不会重启系统——遇到 `access-denied` 仍会如实记录并停止。重试成功的判据是 `result=ok` 且独立测源差值为正；只有那一次才能用来校准 `0.05 GB` 阈值。
+
 ### 可选配置
 
 `cdrive-report/tool.config.psd1` 是配置模板，**默认不加载**，需显式传入：
