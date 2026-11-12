@@ -121,7 +121,7 @@ $UR = "$env:USERPROFILE\AppData\Roaming"
 $UP = $env:USERPROFILE
 
 # ---------- 版本与运行标识（为升级 / 规范化预留） ----------
-$ScriptVersion = '1.2.0'
+$ScriptVersion = '1.3.0'
 $SchemaVersion = 1
 $RunId         = $stamp
 $ConfigSource   = 'builtin'
@@ -626,7 +626,7 @@ if ($AssessChannels) {
         if ($c.note) { [void]$md.Add(""); [void]$md.Add("> $($c.name)：$($c.note)") }
     }
     [void]$md.Add("")
-    [void]$md.Add("下一步需由用户在管理员 PowerShell 中自行确认执行；本工具的 -SystemClean（阶段 C）尚未实现。")
+    [void]$md.Add("带 -SystemClean 时，本工具会逐条确认后执行白名单内的官方命令；不带则保持只读评估。")
 }
 
 $mdPath = Join-Path $OutDir 'c_drive_analysis_report.md'
@@ -816,8 +816,18 @@ $systemCleanWhitelist = @(
 
 $systemCleanResults = @()
 if ($SystemCleanEnabled) {
+    # 权限预检：只读判断，不执行任何命令。管理员不足时提前说明，避免确认后才被拒。
+    $scExe = Join-Path $env:windir 'System32\Dism.exe'
+    $scExeFound = (Test-Path -LiteralPath $scExe)
+    $scCanRun = $isAdmin -and $scExeFound
+    $scPrecheck = "admin=$(if ($isAdmin) { 1 } else { 0 });exe=$(if ($scExeFound) { 1 } else { 0 });canRun=$(if ($scCanRun) { 1 } else { 0 })"
     Say ""
     Say "[系统官方通道] 白名单 $($systemCleanWhitelist.Count) 条，逐条确认；演练模式零执行。" 'Cyan'
+    Say ("     预检：$scPrecheck") 'DarkGray'
+    if (-not $scCanRun) {
+        Say "     [预检] 当前会话无法执行：请以管理员身份运行（命令会返回 740）。" 'Yellow'
+        Log ("SYSCH-PRECHECK $scPrecheck")
+    }
     foreach ($sc in $systemCleanWhitelist) {
         if ($script:abort) { break }
         $r = [pscustomobject]@{
@@ -844,17 +854,18 @@ if ($SystemCleanEnabled) {
             continue
         }
 
-        $ans = Ask "确认执行这条系统命令？"
-        if ($ans -eq 'quit') { $script:abort = $true; Log ("SYSCH-QUIT {0}" -f $sc.id); break }
-        if ($ans -ne 'yes') { $r.result = 'skipped'; Log ("SYSCH-SKIP {0}" -f $sc.id); $systemCleanResults += $r; continue }
-        if ($sc.admin -and -not $isAdmin) {
-            $r.result = 'skipped'
-            $r.note = '需要管理员权限'
-            Say "     [跳过] 需要管理员权限" 'Yellow'
-            Log ("SYSCH-ADMIN {0}" -f $sc.id)
+        # 权限检查在询问之前：不做无法兑现的确认。
+        if ($sc.admin -and -not $scCanRun) {
+            $r.result = 'blocked'
+            $r.note = '权限预检未通过：需要管理员身份与 DISM 可执行文件'
+            Say "     [阻断] 权限预检未通过，跳过确认与执行" 'Yellow'
+            Log ("SYSCH-BLOCKED {0} {1}" -f $sc.id, $scPrecheck)
             $systemCleanResults += $r
             continue
         }
+        $ans = Ask "确认执行这条系统命令？"
+        if ($ans -eq 'quit') { $script:abort = $true; Log ("SYSCH-QUIT {0}" -f $sc.id); break }
+        if ($ans -ne 'yes') { $r.result = 'skipped'; Log ("SYSCH-SKIP {0}" -f $sc.id); $systemCleanResults += $r; continue }
 
         $r.executed = $true
         $r.freeBeforeGB = [math]::Round((GetFree) / 1GB, 3)
@@ -863,7 +874,10 @@ if ($SystemCleanEnabled) {
         $r.exitCode = $LASTEXITCODE
         $r.freeAfterGB = [math]::Round((GetFree) / 1GB, 3)
         $r.deltaGB = [math]::Round($r.freeAfterGB - $r.freeBeforeGB, 3)
-        if ($r.exitCode -ne 0) {
+        if ($r.exitCode -eq 740) {
+            $r.result = 'elevation-required'
+            $r.note = '命令返回 740：需要提升权限，未修改系统'
+        } elseif ($r.exitCode -ne 0) {
             $r.result = 'failed'
             $r.note = '命令返回非零退出码'
         } elseif ([math]::Abs($r.deltaGB) -lt 0.05) {
@@ -884,12 +898,43 @@ if ($SystemCleanEnabled) {
     $scStatus += "SYSTEM_CLEAN_COUNT=$($systemCleanWhitelist.Count)"
     $scStatus += "SYSTEM_CLEAN_DRYRUN=$(if ($DryRun) { 1 } else { 0 })"
     $scStatus += "SYSTEM_CLEAN_EXECUTED=$(@($systemCleanResults | Where-Object { $_.executed }).Count)"
+    $scStatus += "SYSTEM_CLEAN_PRECHECK=$scPrecheck"
     foreach ($r in $systemCleanResults) {
         $scStatus += "SYSTEM_CLEAN_ITEM=$($r.id):$($r.result):exit=$($r.exitCode):deltaGB=$($r.deltaGB)"
     }
     [System.IO.File]::AppendAllLines($statusPath, [string[]]$scStatus, (New-Object System.Text.UTF8Encoding($false)))
+
+    # 结果回写 JSON：只在末尾追加字段，不重序列化，既有字段逐字节不变
+    try {
+        $jText = [System.IO.File]::ReadAllText($jsonPath).TrimEnd()
+        $jCut = $jText.LastIndexOf('}')
+        if ($jCut -gt 0) {
+            $scJson = ConvertTo-Json -InputObject @($systemCleanResults) -Depth 5 -Compress
+            $pcJson = ConvertTo-Json -InputObject $scPrecheck -Compress
+            $jNew = $jText.Substring(0, $jCut) + ',"systemClean":' + $scJson + ',"systemCleanPrecheck":' + $pcJson + '}'
+            [System.IO.File]::WriteAllText($jsonPath, $jNew, (New-Object System.Text.UTF8Encoding($false)))
+        }
+    } catch {
+        Log ("SYSCH-JSON-FAIL " + $_.Exception.Message)
+    }
+
+    # 报告追加第 12 节
+    $scMd = @()
+    $scMd += ""
+    $scMd += "## 12. 系统官方通道执行结果"
+    $scMd += ""
+    $scMd += "> 权限预检：$scPrecheck。判定「是否释放更多空间」只以执行前后可用空间的实测差值为准；差值落在噪声带内记 unknown，不估算。"
+    $scMd += ""
+    $scMd += "| 通道 | 结果 | 是否执行 | 退出码 | 执行前可用(GB) | 执行后可用(GB) | 差值(GB) | 说明 |"
+    $scMd += "|---|---|---|---|---|---|---|---|"
+    foreach ($r in $systemCleanResults) {
+        $scMd += "| $($r.id) $($r.name) | $($r.result) | $(if($r.executed){'是'}else{'否'}) | $($r.exitCode) | $($r.freeBeforeGB) | $($r.freeAfterGB) | $($r.deltaGB) | $($r.note) |"
+    }
+    $scMd += ""
+    [System.IO.File]::AppendAllLines($mdPath, [string[]]$scMd, (New-Object System.Text.UTF8Encoding($false)))
+
     Say ""
-    Say (" 系统通道结果已追加到状态文件：{0}" -f $statusPath) 'DarkGray'
+    Say " 系统通道结果已写入状态文件、JSON 与报告第 12 节。" 'DarkGray'
 }
 
 # ============================================================

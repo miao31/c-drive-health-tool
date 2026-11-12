@@ -293,12 +293,13 @@ Copy-Item "路径\cdrive-report\c_drive_analysis_report.md" `
 |---|---|
 | 1.1.0 | 阶段 A：版本与运行标识、可选配置、报告归档、追加式状态契约；阶段 B：`-AssessSystemChannels` 系统官方通道只读评估（报告第 11 节） |
 | 1.2.0 | 阶段 C1：`-SystemClean` 独立开关、硬编码命令白名单、逐条确认、执行前后可用空间实测、`-DryRun` 零执行、结果追加到状态文件 |
+| 1.3.0 | 阶段 C2：权限预检前置（避免确认后才被拒）、`740 需要提升权限` 单独判定、结果回写 JSON 与报告第 12 节 |
 
 > 1.1.0 之前的提交未使用版本号。从本版本起按阶段记录变更。
 > 本版本包含阶段 A 与阶段 B 两个阶段的合并改动；分阶段提交从下一阶段起执行。
 > 后续约定：每完成并验证一个阶段，提交一次 commit、推送一次，并打一个版本 tag。
 
-当前版本 `1.2.0`（脚本内 `$ScriptVersion`）。输出 JSON 与状态文件带 `toolVersion`、`schemaVersion`、`runId`、`configSource`、`runMode`、`scanSeconds`。
+当前版本 `1.3.0`（脚本内 `$ScriptVersion`）。输出 JSON 与状态文件带 `toolVersion`、`schemaVersion`、`runId`、`configSource`、`runMode`、`scanSeconds`。
 
 **状态文件是追加式契约**：`SCAN_DONE`、`HEALTH`、`LOW_SUM_GB`、`REPORT_OK` 等既有字段不变，只新增以下字段，现有自动化读取方式无需改动：
 
@@ -307,10 +308,15 @@ TOOL_VERSION=<版本>   SCHEMA_VERSION=<整数>   RUN_ID=<时间戳>
 CONFIG_SOURCE=<来源>  RUN_MODE=<readonly|clean|clean-dryrun>   SCAN_SECONDS=<秒>
 SYSTEM_CLEAN_COUNT=<白名单条数>   SYSTEM_CLEAN_DRYRUN=<0|1>
 SYSTEM_CLEAN_EXECUTED=<实际执行条数>
+SYSTEM_CLEAN_PRECHECK=admin=<0|1>;exe=<0|1>;canRun=<0|1>
 SYSTEM_CLEAN_ITEM=<id>:<结果>:exit=<退出码>:deltaGB=<差值>
 ```
 
-`SYSTEM_CLEAN_*` 只在带 `-SystemClean` 时追加，其余字段一字不改。
+`SYSTEM_CLEAN_*` 只在带 `-SystemClean` 时追加，其余字段一字不改。结果同时写入 JSON 的 `systemClean` / `systemCleanPrecheck` 字段，以及报告第 12 节。
+
+结果取值：`dryrun`（演练零执行）、`blocked`（权限预检未通过）、`skipped`（用户跳过）、`elevation-required`（命令返回 740）、`failed`（其它非零退出码）、`unknown`（差值落在噪声带，不判定释放量）、`ok`。
+
+**权限预检**在询问之前执行：只判断当前是否管理员、DISM 是否存在，不运行任何命令。普通权限下直接标 `blocked` 并说明原因，不会先让你按 `Y` 再拒绝。本机实测：非管理员运行 DISM 返回 `740 需要提升权限`，0.1 秒即失败。
 
 ### 可选配置
 
@@ -347,11 +353,11 @@ Dism.exe /Online /Cleanup-Image /StartComponentCleanup
 
 执行链路：
 
-1. 逐条显示命令与说明，单独询问 `Y/N/L/Q`（回车默认跳过）；
-2. 需要管理员权限的命令在普通权限下自动跳过，不报错中断；
+1. **权限预检**（只读判断，不执行命令）：管理员身份、DISM 是否存在；不通过即标 `blocked`，不再询问；
+2. 逐条显示命令与说明，单独询问 `Y/N/L/Q`（回车默认跳过）；
 3. 执行前后各测一次 C 盘可用空间，差值即实测释放量；
-4. 退出码非零 → 记 `failed`；差值绝对值 < 0.05 GB → 记 `unknown`，**不判定释放量**；否则记 `ok`；
-5. 结果追加到状态文件，并写入 `cleanup-log-<时间戳>.txt`。
+4. 退出码 `740` → `elevation-required`；其它非零 → `failed`；差值绝对值 < 0.05 GB → `unknown`，**不判定释放量**；否则 `ok`；
+5. 结果追加到状态文件、JSON 与报告第 12 节，并写入 `cleanup-log-<时间戳>.txt`。
 
 严格边界：
 
