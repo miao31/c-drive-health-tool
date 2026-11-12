@@ -121,7 +121,7 @@ $UR = "$env:USERPROFILE\AppData\Roaming"
 $UP = $env:USERPROFILE
 
 # ---------- 版本与运行标识（为升级 / 规范化预留） ----------
-$ScriptVersion = '1.4.0'
+$ScriptVersion = '1.5.0'
 $SchemaVersion = 1
 $RunId         = $stamp
 $ConfigSource   = 'builtin'
@@ -489,7 +489,11 @@ $jsonPath = Join-Path $OutDir "c_drive_scan_$stamp.json"
 # 只导出数据字段：pre/post 是 ScriptBlock，序列化后会撑到数 MB
 $jsonItems = @($itemList | Select-Object id, name, paths, size, count, risk, reason, recover, how,
                                               cleanable, admin, complete, lastWrite, topDirs, topFiles)
-$runMode = if ($Clean) { if ($DryRun) { 'clean-dryrun' } else { 'clean' } } else { 'readonly' }
+$runMode = if ($Clean) {
+    if ($DryRun) { 'clean-dryrun' } else { 'clean' }
+} elseif ($SystemCleanEnabled) {
+    if ($DryRun) { 'system-clean-dryrun' } else { 'system-clean' }
+} else { 'readonly' }
 $payload = [pscustomobject]@{
     stamp         = $stamp
     scannedAt     = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')

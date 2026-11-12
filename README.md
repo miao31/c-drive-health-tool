@@ -295,18 +295,19 @@ Copy-Item "路径\cdrive-report\c_drive_analysis_report.md" `
 | 1.2.0 | 阶段 C1：`-SystemClean` 独立开关、硬编码命令白名单、逐条确认、执行前后可用空间实测、`-DryRun` 零执行、结果追加到状态文件 |
 | 1.3.0 | 阶段 C2：权限预检前置（避免确认后才被拒）、`740 需要提升权限` 单独判定、结果回写 JSON 与报告第 12 节 |
 | 1.4.0 | 阶段 C3：真实执行后修正判定——`5 E_ACCESSDENIED` 单独判定、负差值不判 `ok`、失败保留命令输出尾部 |
+| 1.5.0 | 阶段 C4：`RUN_MODE` 区分系统通道执行与演练；补充两次真实执行的差值对照与噪声阈值边界 |
 
 > 1.1.0 之前的提交未使用版本号。从本版本起按阶段记录变更。
 > 本版本包含阶段 A 与阶段 B 两个阶段的合并改动；分阶段提交从下一阶段起执行。
 > 后续约定：每完成并验证一个阶段，提交一次 commit、推送一次，并打一个版本 tag。
 
-当前版本 `1.4.0`（脚本内 `$ScriptVersion`）。输出 JSON 与状态文件带 `toolVersion`、`schemaVersion`、`runId`、`configSource`、`runMode`、`scanSeconds`。
+当前版本 `1.5.0`（脚本内 `$ScriptVersion`）。输出 JSON 与状态文件带 `toolVersion`、`schemaVersion`、`runId`、`configSource`、`runMode`、`scanSeconds`。
 
 **状态文件是追加式契约**：`SCAN_DONE`、`HEALTH`、`LOW_SUM_GB`、`REPORT_OK` 等既有字段不变，只新增以下字段，现有自动化读取方式无需改动：
 
 ```
 TOOL_VERSION=<版本>   SCHEMA_VERSION=<整数>   RUN_ID=<时间戳>
-CONFIG_SOURCE=<来源>  RUN_MODE=<readonly|clean|clean-dryrun>   SCAN_SECONDS=<秒>
+CONFIG_SOURCE=<来源>  RUN_MODE=<readonly|clean|clean-dryrun|system-clean|system-clean-dryrun>   SCAN_SECONDS=<秒>
 SYSTEM_CLEAN_COUNT=<白名单条数>   SYSTEM_CLEAN_DRYRUN=<0|1>
 SYSTEM_CLEAN_EXECUTED=<实际执行条数>
 SYSTEM_CLEAN_PRECHECK=admin=<0|1>;exe=<0|1>;canRun=<0|1>
@@ -326,7 +327,11 @@ SYSTEM_CLEAN_ITEM=<id>:<结果>:exit=<退出码>:deltaGB=<差值>
 - 命令失败时可用空间可能**不增反减**（清理过程产生临时文件与日志），所以退出码 0 也不能把负差值判成 `ok`；
 - 判定「是否释放更多空间」不能只看差值，必须同时看退出码。`access-denied` 与 `space-decreased` 都会保留命令输出尾部写入日志，便于定位。
 
-> 噪声阈值 `0.05 GB` 尚未经成功清理案例校准：本次退出码非零，差值分支没有走到。保持该值直至有成功样本。
+**第二次真实执行（2026-11-12）**：同样在管理员权限下执行，`SYSTEM_CLEAN_PRECHECK=admin=1;exe=1;canRun=1`、`EXECUTED=1`，退出码仍为 `5`、`result=access-denied`。三个独立测源一致记录可用空间**增加 54.3 MB**，工具自报 `deltaGB=0.053`，与独立差值偏差小于 0.03 MB。CBS 日志显示为 `Failed to FinalizeEx using worker session`、`StartComponentCleanupEx(hr:0x80070005)`。
+
+两次失败的空间变化方向相反（-937.6 MB 与 +54.3 MB），幅度都超过 `0.05 GB` 阈值，退出码却都是 5。所以差值必须在退出码为 0 之后才参与判定：即使差值为正且越过噪声带，命令失败时也不能当作释放量。当前判定顺序为 `740 → 5 → 其它非 0 → 负差值 → 噪声 → ok`，已满足这一点。
+
+> 噪声阈值 `0.05 GB` 尚未经成功清理案例校准：两次执行退出码都非零，差值分支没有走到。第二次的 +54.3 MB 是失败命令产生的空间波动，不是释放量。保持该值直至有成功样本。
 
 **E_ACCESSDENIED 是什么、怎么重试**：这是 Windows 组件存储的事务提交失败，**不是本工具权限不足**（会话已是管理员，`SYSTEM_CLEAN_PRECHECK=admin=1;exe=1;canRun=1`）。本机后续只读检查：目标 `.cat` 文件仍存在、所有者 `NT SERVICE\TrustedInstaller`、Administrators 仅 `ReadAndExecute`；`SessionsPending` 有残留会话键但 `Exclusive=0`；`RebootPending=false`、`pending.xml` 不存在、无并发 DISM/TiWorker 进程；系统为 26H2 build 26300.9974，卷 `Healthy`。
 
