@@ -20,7 +20,10 @@ param(
     [switch]$Clean,
     [switch]$DryRun,
     [switch]$ListPersonalFiles,
+    [switch]$Archive,
+    [switch]$AssessSystemChannels,
     [string]$OutDir = "",
+    [string]$Config = "",
     [int]$DirTimeoutSec = 20,
     [int]$TopFiles = 20,
     [int]$TopSubdirs = 10
@@ -114,7 +117,42 @@ $UL = "$env:USERPROFILE\AppData\Local"
 $UR = "$env:USERPROFILE\AppData\Roaming"
 $UP = $env:USERPROFILE
 
-function Log($m) { [void]$script:logLines.Add((Get-Date).ToString('HH:mm:ss') + "  " + $m) }
+# ---------- 版本与运行标识（为升级 / 规范化预留） ----------
+$ScriptVersion = '1.1.0'
+$SchemaVersion = 1
+$RunId         = $stamp
+$ConfigSource   = 'builtin'
+$ArchiveReport  = [bool]$Archive
+$AssessChannels = [bool]$AssessSystemChannels
+
+# ---------- 可选配置：只覆盖非安全关键参数 ----------
+# 配置缺失、解析失败或越界，一律回退内置默认值。
+# $catalog、Guard-Path 与删除逻辑永不从配置读取。
+if (-not [string]::IsNullOrWhiteSpace($Config)) {
+    if (-not (Test-Path -LiteralPath $Config)) {
+        $ConfigSource = 'builtin (config missing)'
+    } else {
+        try {
+            $cfg = Import-PowerShellDataFile -LiteralPath $Config -ErrorAction Stop
+            if ($cfg.ContainsKey('DirTimeoutSec')) {
+                $v = [int]$cfg['DirTimeoutSec']; if ($v -ge 1 -and $v -le 3600) { $DirTimeoutSec = $v }
+            }
+            if ($cfg.ContainsKey('TopFiles')) {
+                $v = [int]$cfg['TopFiles']; if ($v -ge 1 -and $v -le 200) { $TopFiles = $v }
+            }
+            if ($cfg.ContainsKey('TopSubdirs')) {
+                $v = [int]$cfg['TopSubdirs']; if ($v -ge 1 -and $v -le 200) { $TopSubdirs = $v }
+            }
+            if ($cfg.ContainsKey('ArchiveOnScan')) { $ArchiveReport = [bool]$cfg['ArchiveOnScan'] }
+            if ($cfg.ContainsKey('AssessSystemChannelsOnScan')) { $AssessChannels = [bool]$cfg['AssessSystemChannelsOnScan'] }
+            $ConfigSource = $Config
+        } catch {
+            $ConfigSource = 'builtin (config error)'
+        }
+    }
+}
+
+function Log($m) { [void]$script:logLines.Add(("{0}  [{1}]  {2}" -f (Get-Date).ToString('HH:mm:ss'), $RunId, $m)) }
 function Say($m, $c) { if (-not $c) { $c = 'White' }; Write-Host $m -ForegroundColor $c; Log $m }
 function Fmt($b) {
     $b = [double]$b
@@ -377,6 +415,41 @@ $lowItems = @($itemList | Where-Object { $_.risk -eq 'low' })
 $cfmItems = @($itemList | Where-Object { $_.risk -eq 'confirm' })
 $proItems = @($itemList | Where-Object { $_.risk -eq 'protected' })
 
+# ---------- 系统官方通道：只读评估（-AssessSystemChannels） ----------
+# 复用本次扫描结果：不重复枚举、不调用任何外部命令、不修改系统设置。
+# 占用 ≠ 可回收量；合并统计项不拆分到单个通道，一律留 unknown。
+$systemChannels = @()
+if ($AssessChannels) {
+    $channelMap = @(
+        @{ id='WINSXS';        name='组件存储 WinSxS';  itemIds=@('P01');       sizeItem=$null;  cmd='Dism.exe /Online /Cleanup-Image /StartComponentCleanup'; reversible='否';       admin=$true;  stage='C 阶段候选'; note='P01 为 9 个路径合并统计，不可拆分' }
+        @{ id='DRIVERSTORE';   name='旧版驱动包';      itemIds=@('P01');       sizeItem=$null;  cmd='cleanmgr → 设备驱动程序包';                            reversible='否';       admin=$true;  stage='C 阶段候选'; note='同上，合并项，占用不可单独给出' }
+        @{ id='WU_CACHE';      name='更新下载缓存';    itemIds=@('L12');       sizeItem='L12'; cmd='本工具 L12（逐项确认）';                               reversible='部分';    admin=$true;  stage='现有能力';   note='' }
+        @{ id='SYS_LOGS';      name='系统日志';        itemIds=@('L10','L11'); sizeItem=$null;  cmd='本工具 L10 / L11（逐项确认）';                         reversible='否';       admin=$true;  stage='现有能力';   note='两项合计见报告第 4 节，不重复计算' }
+        @{ id='RECYCLEBIN';    name='回收站';          itemIds=@('L16');       sizeItem='L16'; cmd='本工具 L16 / Clear-RecycleBin';                        reversible='否';       admin=$false; stage='现有能力';   note='' }
+        @{ id='OLD_SYSTEM';    name='旧系统与回退残留';itemIds=@('C06','C07'); sizeItem=$null;  cmd='设置 → 系统 → 存储 → 临时文件';                         reversible='否';       admin=$true;  stage='C 阶段候选'; note='confirm 类，仅统计不处理' }
+        @{ id='HIBERNATE';     name='休眠 / 页面文件'; itemIds=@('P06');       sizeItem=$null;  cmd='powercfg /h off（明确不进白名单）';                    reversible='需手动重开'; admin=$true; stage='不执行';    note='P06 已保护，本工具不处理' }
+        @{ id='STORAGE_SENSE'; name='存储感知';        itemIds=@();            sizeItem=$null;  cmd='设置 → 系统 → 存储 → 存储感知';                         reversible='视配置';  admin=$false; stage='C 阶段候选'; note='无对应清单项，仅给入口' }
+    )
+    foreach ($c in $channelMap) {
+        $bytes = $null
+        if ($c.sizeItem) {
+            $hit = @($itemList | Where-Object { $_.id -eq $c.sizeItem } | Select-Object -First 1)
+            if ($hit.Count -gt 0) { $bytes = [long]$hit[0].size }
+        }
+        $systemChannels += [pscustomobject]@{
+            id         = $c.id
+            name       = $c.name
+            itemIds    = @($c.itemIds)
+            bytes      = $bytes
+            command    = $c.cmd
+            reversible = $c.reversible
+            admin      = [bool]$c.admin
+            stage      = $c.stage
+            note       = $c.note
+        }
+    }
+}
+
 # ---------- 健康判定（可用 <10 GB 紧急 / <15 GB 偏低 / 否则正常） ----------
 if ($dFree -lt 10GB)     { $health = '紧急：可用空间低于 10 GB，建议立即清理' }
 elseif ($dFree -lt 15GB) { $health = '偏低：建议近期安排一次清理' }
@@ -412,17 +485,25 @@ $jsonPath = Join-Path $OutDir "c_drive_scan_$stamp.json"
 # 只导出数据字段：pre/post 是 ScriptBlock，序列化后会撑到数 MB
 $jsonItems = @($itemList | Select-Object id, name, paths, size, count, risk, reason, recover, how,
                                               cleanable, admin, complete, lastWrite, topDirs, topFiles)
+$runMode = if ($Clean) { if ($DryRun) { 'clean-dryrun' } else { 'clean' } } else { 'readonly' }
 $payload = [pscustomobject]@{
-    stamp       = $stamp
-    scannedAt   = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-    outDir      = $OutDir
-    diskSize    = $dSize
-    diskFree    = $dFree
-    freePct     = [math]::Round($freePct, 1)
-    lowSum      = $lowSum
-    health      = $health
-    scriptPath  = $scriptPath
-    items       = $jsonItems
+    stamp         = $stamp
+    scannedAt     = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    toolVersion   = $ScriptVersion
+    schemaVersion = $SchemaVersion
+    runId         = $RunId
+    configSource  = $ConfigSource
+    runMode       = $runMode
+    scanSeconds   = [math]::Round($scanSw.Elapsed.TotalSeconds, 1)
+    systemChannels= @($systemChannels)
+    outDir        = $OutDir
+    diskSize      = $dSize
+    diskFree      = $dFree
+    freePct       = [math]::Round($freePct, 1)
+    lowSum        = $lowSum
+    health        = $health
+    scriptPath    = $scriptPath
+    items         = $jsonItems
 }
 [System.IO.File]::WriteAllText($jsonPath, ($payload | ConvertTo-Json -Depth 8 -Compress), (New-Object System.Text.UTF8Encoding($false)))
 
@@ -527,8 +608,36 @@ foreach ($i in ($itemList | Where-Object { $_.risk -ne 'protected' } | Select-Ob
 [void]$md.Add("- 所有释放空间为估算值，实际以清理结束时的可用空间为准。")
 [void]$md.Add("- 禁止使用第三方清理软件处理 WinSxS 与 Windows\Installer。")
 
+if ($AssessChannels) {
+    [void]$md.Add("## 11. 系统官方通道评估（只读）")
+    [void]$md.Add("")
+    [void]$md.Add("> 本节只复用本次扫描结果，**未执行任何系统清理命令，未修改系统设置**。占用 ≠ 可回收量；本工具不估算可回收量，合并统计项不拆分，一律标 unknown。")
+    [void]$md.Add("")
+    [void]$md.Add("| 通道 | 对应清单项 | 当前占用 | 官方命令 / 入口 | 可逆性 | 管理员 | 计划阶段 |")
+    [void]$md.Add("|---|---|---|---|---|---|---|")
+    foreach ($c in $systemChannels) {
+        $occ = if ($null -eq $c.bytes) { 'unknown' } else { Fmt $c.bytes }
+        $ids = if ($c.itemIds.Count -gt 0) { $c.itemIds -join ', ' } else { '-' }
+        [void]$md.Add("| $($c.name) | $ids | $occ | $($c.command) | $($c.reversible) | $(if($c.admin){'是'}else{'否'}) | $($c.stage) |")
+        if ($c.note) { [void]$md.Add(""); [void]$md.Add("> $($c.name)：$($c.note)") }
+    }
+    [void]$md.Add("")
+    [void]$md.Add("下一步需由用户在管理员 PowerShell 中自行确认执行；本工具的 -SystemClean（阶段 C）尚未实现。")
+}
+
 $mdPath = Join-Path $OutDir 'c_drive_analysis_report.md'
 [System.IO.File]::WriteAllLines($mdPath, $md, (New-Object System.Text.UTF8Encoding($true)))
+
+# 报告归档：把原先散落在调度器里的 Copy-Item 收进工具自身，仅只读扫描生效
+if ($ArchiveReport -and -not $Clean) {
+    $archivePath = Join-Path $OutDir ("weekly-report-{0}.md" -f (Get-Date -Format 'yyyyMMdd'))
+    try {
+        Copy-Item -LiteralPath $mdPath -Destination $archivePath -Force -ErrorAction Stop
+        Say " 报告已存档：$archivePath" 'DarkGray'
+    } catch {
+        Say " [注意] 报告存档失败：$($_.Exception.Message)" 'Yellow'
+    }
+}
 
 $statusPath = Join-Path $OutDir "c_drive_scan_status_$stamp.txt"
 $out = @()
@@ -540,6 +649,16 @@ $out += "ITEMS=$($itemList.Count)  LOW=$($lowItems.Count)  CONFIRM=$($cfmItems.C
 $out += "LOW_SUM_GB=$([math]::Round($lowSum/1GB,2))"
 $out += "HEALTH=$health"
 $out += "REPORT_OK=$((Test-Path -LiteralPath $mdPath) -and ((Get-Item -LiteralPath $mdPath).Length -gt 0))"
+$out += "TOOL_VERSION=$ScriptVersion"
+$out += "SCHEMA_VERSION=$SchemaVersion"
+$out += "RUN_ID=$RunId"
+$out += "CONFIG_SOURCE=$ConfigSource"
+$out += "RUN_MODE=$runMode"
+$out += "SCAN_SECONDS=$([math]::Round($scanSw.Elapsed.TotalSeconds, 1))"
+if ($AssessChannels) {
+    $out += "SYSTEM_CHANNEL_COUNT=$($systemChannels.Count)"
+    $out += "SYSTEM_CHANNEL_ASSESSED=1"
+}
 [System.IO.File]::WriteAllLines($statusPath, $out, (New-Object System.Text.UTF8Encoding($false)))
 
 Say " 报告已生成：" 'DarkGray'

@@ -130,7 +130,10 @@ cd "路径\cdrive-report"
 | `-Clean` | 开关 | 关 | 进入清理模式。不加则纯只读 |
 | `-DryRun` | 开关 | 关 | 演练：走流程但不真删（仅在清理模式生效）|
 | `-ListPersonalFiles` | 开关 | 关 | 列出下载/桌面 ≥5 MB 的安装包及手动处理指引 |
+| `-Archive` | 开关 | 关 | 只读扫描结束时另存 `weekly-report-<yyyyMMdd>.md` |
+| `-AssessSystemChannels` | 开关 | 关 | 只读评估系统官方通道，报告追加第 11 节、状态文件追加评估标记 |
 | `-OutDir` | 字符串 | 脚本所在目录 | 报告输出目录 |
+| `-Config` | 字符串 | 空（不加载） | 可选配置文件的路径，见「版本、配置与演进」 |
 | `-DirTimeoutSec` | 整数 | `20` | 单个目录扫描超时（秒），超时即降级 |
 | `-TopFiles` | 整数 | `20` | 每项最多列出的大文件数 |
 | `-TopSubdirs` | 整数 | `10` | 每项最多列出的子目录数 |
@@ -261,6 +264,67 @@ Copy-Item "路径\cdrive-report\c_drive_analysis_report.md" `
 
 - **绝对不要给定时任务加 `-Clean`** —— 无人值守时没人按键，加了也不会删，但会白白阻塞等待输入；
 - 之后读取最新的 `c_drive_scan_status_*.txt` 即可拿到可用空间、健康状态与可释放量，据此决定是否人工介入。
+
+---
+
+## 版本、配置与演进
+
+### 版本记录
+
+| 版本 | 内容 |
+|---|---|
+| 1.1.0 | 阶段 A：版本与运行标识、可选配置、报告归档、追加式状态契约；阶段 B：`-AssessSystemChannels` 系统官方通道只读评估（报告第 11 节） |
+
+> 1.1.0 之前的提交未使用版本号。从本版本起按阶段记录变更。
+> 本版本包含阶段 A 与阶段 B 两个阶段的合并改动；分阶段提交从下一阶段起执行。
+> 后续约定：每完成并验证一个阶段，提交一次 commit、推送一次，并打一个版本 tag。
+
+当前版本 `1.1.0`（脚本内 `$ScriptVersion`）。输出 JSON 与状态文件带 `toolVersion`、`schemaVersion`、`runId`、`configSource`、`runMode`、`scanSeconds`。
+
+**状态文件是追加式契约**：`SCAN_DONE`、`HEALTH`、`LOW_SUM_GB`、`REPORT_OK` 等既有字段不变，只新增以下字段，现有自动化读取方式无需改动：
+
+```
+TOOL_VERSION=<版本>   SCHEMA_VERSION=<整数>   RUN_ID=<时间戳>
+CONFIG_SOURCE=<来源>  RUN_MODE=<readonly|clean|clean-dryrun>   SCAN_SECONDS=<秒>
+```
+
+### 可选配置
+
+`cdrive-report/tool.config.psd1` 是配置模板，**默认不加载**，需显式传入：
+
+```powershell
+.\c_drive_tool.ps1 -Config .\tool.config.psd1
+```
+
+只含 4 个非安全关键项：`DirTimeoutSec`、`TopFiles`、`TopSubdirs`、`ArchiveOnScan`。配置文件缺失、解析失败、数值越界时自动回退内置默认值，并在 `CONFIG_SOURCE` 标出原因。`$catalog`、`Guard-Path` 与删除逻辑**永不从配置读取**——配置化不等于把安全边界交出去。
+
+### 报告归档
+
+`-Archive`（或配置 `ArchiveOnScan = $true`）在只读扫描结束时把报告另存为 `weekly-report-<yyyyMMdd>.md`。文件名与既有每周体检任务一致，重复执行幂等；原先写在调度器里的 `Copy-Item` 胶水逻辑由此收进工具自身。归档失败只提示、不中断扫描。
+
+### 系统官方通道评估（只读）
+
+`-AssessSystemChannels`（或配置 `AssessSystemChannelsOnScan = $true`）在只读扫描结束后，把**系统官方通道**汇总成报告第 11 节：组件存储清理、旧版驱动包、更新下载缓存、系统日志、回收站、旧系统残留、休眠/页面文件、存储感知，逐条给出对应清单项、当前占用、官方命令或入口、可逆性、权限与计划阶段。
+
+严格边界：
+
+- **不执行** `Dism` / `cleanmgr` / `powercfg` / `vssadmin` 等任何外部命令，不修改系统设置，不代配置 `cleanmgr /sageset`；
+- 复用本次扫描结果，不重复枚举目录；合并统计项（如 `P01`）**不拆分到单个通道**，占用标 `unknown`；
+- **占用 ≠ 可回收量**，本工具不估算、不伪造释放量；
+- 状态文件只在开关开启时追加 `SYSTEM_CHANNEL_COUNT` / `SYSTEM_CHANNEL_ASSESSED`，其余字段一字不改。
+
+阶段 C 的 `-SystemClean`（命令白名单 + 逐项确认执行）尚未实现；在此之前，官方命令需由用户按报告自行在管理员 PowerShell 中确认执行。
+
+### 定位与演进方向
+
+定位：**在保证安全边界的基础上，实现释放最多空间**。安全是底线，不是天花板。
+
+底线有两层，任何阶段不得削弱：
+
+1. **交互层** —— 默认只读、`-Clean` 才进入清理、逐项 `Y/N/L/Q` 确认、回车默认跳过、`-DryRun` 演练。
+2. **目录层** —— 33 项固化清单与三级风险分级不放松，`protected` / `confirm` 不转可清理，Guard-Path 与降级禁止清理保持不变。
+
+因此空间增量优先从**系统官方通道**取得（DISM 组件存储清理、cleanmgr、存储感知），由用户逐项确认后执行，而不是靠放宽目录分级。路线：规范化地基 ✅ → 官方通道只读评估 ✅（`-AssessSystemChannels`）→ 官方通道确认执行（下一步，阶段 C）→ 覆盖与只读报告增强 → 模块化 → 独立软件 → 商用预留。图形界面与降低确认摩擦在守住两层底线的前提下可以评估，**不预先排除**。
 
 ---
 
