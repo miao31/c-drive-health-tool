@@ -121,7 +121,7 @@ $UR = "$env:USERPROFILE\AppData\Roaming"
 $UP = $env:USERPROFILE
 
 # ---------- 版本与运行标识（为升级 / 规范化预留） ----------
-$ScriptVersion = '1.3.0'
+$ScriptVersion = '1.4.0'
 $SchemaVersion = 1
 $RunId         = $stamp
 $ConfigSource   = 'builtin'
@@ -870,21 +870,37 @@ if ($SystemCleanEnabled) {
         $r.executed = $true
         $r.freeBeforeGB = [math]::Round((GetFree) / 1GB, 3)
         $scArgs = $sc.args
-        $null = & $sc.file @scArgs 2>&1
+        Say "     执行中，组件存储清理可能持续数分钟；结束后显示退出码与实测差值。" 'DarkGray'
+        # 留一份输出尾部：命令失败时写进日志和结果，便于定位，不再全部丢弃。
+        $scOut = @(& $sc.file @scArgs 2>&1)
         $r.exitCode = $LASTEXITCODE
         $r.freeAfterGB = [math]::Round((GetFree) / 1GB, 3)
         $r.deltaGB = [math]::Round($r.freeAfterGB - $r.freeBeforeGB, 3)
         if ($r.exitCode -eq 740) {
             $r.result = 'elevation-required'
             $r.note = '命令返回 740：需要提升权限，未修改系统'
+        } elseif ($r.exitCode -eq 5) {
+            $r.result = 'access-denied'
+            $r.note = '命令返回 5：E_ACCESSDENIED，组件存储事务未提交；查看 CBS.log 与 dism.log'
         } elseif ($r.exitCode -ne 0) {
             $r.result = 'failed'
-            $r.note = '命令返回非零退出码'
-        } elseif ([math]::Abs($r.deltaGB) -lt 0.05) {
+            $r.note = "命令返回非零退出码 $($r.exitCode)"
+        } elseif ($r.deltaGB -le -0.05) {
+            # 退出码为 0 也不能把「空间变少」当成释放成功。
+            $r.result = 'space-decreased'
+            $r.note = '命令成功但可用空间减少；可能是临时文件/日志增长，不判定释放量'
+        } elseif ($r.deltaGB -lt 0.05) {
             $r.result = 'unknown'
             $r.note = '可用空间差值落在噪声带内，不判定释放量'
         } else {
             $r.result = 'ok'
+        }
+        if ($r.result -in @('access-denied', 'failed', 'elevation-required', 'space-decreased')) {
+            $tail = @($scOut | Select-Object -Last 12 | ForEach-Object { $_.ToString().Trim() } | Where-Object { $_ })
+            if ($tail.Count -gt 0) {
+                $r.note = $r.note + '；输出尾部：' + (($tail | Select-Object -Last 3) -join ' | ')
+                foreach ($ln in $tail) { Log ("SYSCH-OUT " + $ln) }
+            }
         }
         $scColor = if ($r.result -eq 'ok') { 'Green' } else { 'Yellow' }
         Say ("     退出码 {0}；可用空间 {1} -> {2} GB（差值 {3} GB）；判定 {4}" -f

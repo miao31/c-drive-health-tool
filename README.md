@@ -294,12 +294,13 @@ Copy-Item "路径\cdrive-report\c_drive_analysis_report.md" `
 | 1.1.0 | 阶段 A：版本与运行标识、可选配置、报告归档、追加式状态契约；阶段 B：`-AssessSystemChannels` 系统官方通道只读评估（报告第 11 节） |
 | 1.2.0 | 阶段 C1：`-SystemClean` 独立开关、硬编码命令白名单、逐条确认、执行前后可用空间实测、`-DryRun` 零执行、结果追加到状态文件 |
 | 1.3.0 | 阶段 C2：权限预检前置（避免确认后才被拒）、`740 需要提升权限` 单独判定、结果回写 JSON 与报告第 12 节 |
+| 1.4.0 | 阶段 C3：真实执行后修正判定——`5 E_ACCESSDENIED` 单独判定、负差值不判 `ok`、失败保留命令输出尾部 |
 
 > 1.1.0 之前的提交未使用版本号。从本版本起按阶段记录变更。
 > 本版本包含阶段 A 与阶段 B 两个阶段的合并改动；分阶段提交从下一阶段起执行。
 > 后续约定：每完成并验证一个阶段，提交一次 commit、推送一次，并打一个版本 tag。
 
-当前版本 `1.3.0`（脚本内 `$ScriptVersion`）。输出 JSON 与状态文件带 `toolVersion`、`schemaVersion`、`runId`、`configSource`、`runMode`、`scanSeconds`。
+当前版本 `1.4.0`（脚本内 `$ScriptVersion`）。输出 JSON 与状态文件带 `toolVersion`、`schemaVersion`、`runId`、`configSource`、`runMode`、`scanSeconds`。
 
 **状态文件是追加式契约**：`SCAN_DONE`、`HEALTH`、`LOW_SUM_GB`、`REPORT_OK` 等既有字段不变，只新增以下字段，现有自动化读取方式无需改动：
 
@@ -314,9 +315,18 @@ SYSTEM_CLEAN_ITEM=<id>:<结果>:exit=<退出码>:deltaGB=<差值>
 
 `SYSTEM_CLEAN_*` 只在带 `-SystemClean` 时追加，其余字段一字不改。结果同时写入 JSON 的 `systemClean` / `systemCleanPrecheck` 字段，以及报告第 12 节。
 
-结果取值：`dryrun`（演练零执行）、`blocked`（权限预检未通过）、`skipped`（用户跳过）、`elevation-required`（命令返回 740）、`failed`（其它非零退出码）、`unknown`（差值落在噪声带，不判定释放量）、`ok`。
+结果取值：`dryrun`（演练零执行）、`blocked`（权限预检未通过）、`skipped`（用户跳过）、`elevation-required`（退出码 740）、`access-denied`（退出码 5，组件存储事务未提交）、`failed`（其它非零退出码）、`space-decreased`（命令成功但可用空间反而减少）、`unknown`（差值落在噪声带，不判定释放量）、`ok`。
 
 **权限预检**在询问之前执行：只判断当前是否管理员、DISM 是否存在，不运行任何命令。普通权限下直接标 `blocked` 并说明原因，不会先让你按 `Y` 再拒绝。本机实测：非管理员运行 DISM 返回 `740 需要提升权限`，0.1 秒即失败。
+
+**真实执行实测（2026-11-12）**：管理员会话中 `Dism /StartComponentCleanup` 返回退出码 `5`（`0x80070005 E_ACCESSDENIED`），CBS 日志显示删除 `WinSxS\Catalogs\*.cat` 时 `STATUS_CANNOT_DELETE`、事务提交失败；会话收尾为 `Reboot required: no, RepairNeeded: no`。三个独立测源（CIM / DriveInfo / fsutil）一致记录可用空间**减少 937.6 MB**，工具自报 `deltaGB=-0.918`，与独立差值偏差 2.4 MB（来自两次 `Round(x/1GB,3)` 舍入）。
+
+这条实测说明两件事：
+
+- 命令失败时可用空间可能**不增反减**（清理过程产生临时文件与日志），所以退出码 0 也不能把负差值判成 `ok`；
+- 判定「是否释放更多空间」不能只看差值，必须同时看退出码。`access-denied` 与 `space-decreased` 都会保留命令输出尾部写入日志，便于定位。
+
+> 噪声阈值 `0.05 GB` 尚未经成功清理案例校准：本次退出码非零，差值分支没有走到。保持该值直至有成功样本。
 
 ### 可选配置
 
@@ -356,7 +366,7 @@ Dism.exe /Online /Cleanup-Image /StartComponentCleanup
 1. **权限预检**（只读判断，不执行命令）：管理员身份、DISM 是否存在；不通过即标 `blocked`，不再询问；
 2. 逐条显示命令与说明，单独询问 `Y/N/L/Q`（回车默认跳过）；
 3. 执行前后各测一次 C 盘可用空间，差值即实测释放量；
-4. 退出码 `740` → `elevation-required`；其它非零 → `failed`；差值绝对值 < 0.05 GB → `unknown`，**不判定释放量**；否则 `ok`；
+4. 退出码 `740` → `elevation-required`；`5` → `access-denied`；其它非零 → `failed`；差值 ≤ -0.05 GB → `space-decreased`；|差值| < 0.05 GB → `unknown`，**不判定释放量**；否则 `ok`；
 5. 结果追加到状态文件、JSON 与报告第 12 节，并写入 `cleanup-log-<时间戳>.txt`。
 
 严格边界：
