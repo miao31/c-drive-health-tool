@@ -9,6 +9,8 @@
       .\c_drive_tool.ps1                        # 只读扫描（默认，绝不删除任何文件）
       .\c_drive_tool.ps1 -Clean                 # 扫描后进入交互式清理，每一步都要你确认
       .\c_drive_tool.ps1 -Clean -DryRun         # 演练清理，只打印不删除
+      .\c_drive_tool.ps1 -SystemClean -DryRun   # 演练系统官方通道，零执行
+      .\c_drive_tool.ps1 -SystemClean           # 系统官方通道，逐条确认后执行（需管理员）
       .\c_drive_tool.ps1 -ListPersonalFiles     # 额外汇总下载/桌面的安装包（只列出，不删除）
       .\c_drive_tool.ps1 -OutDir D:\some\dir    # 指定报告输出目录
       .\c_drive_tool.ps1 -DirTimeoutSec 30 -TopFiles 10 -TopSubdirs 5
@@ -22,6 +24,7 @@ param(
     [switch]$ListPersonalFiles,
     [switch]$Archive,
     [switch]$AssessSystemChannels,
+    [switch]$SystemClean,
     [string]$OutDir = "",
     [string]$Config = "",
     [int]$DirTimeoutSec = 20,
@@ -118,12 +121,13 @@ $UR = "$env:USERPROFILE\AppData\Roaming"
 $UP = $env:USERPROFILE
 
 # ---------- 版本与运行标识（为升级 / 规范化预留） ----------
-$ScriptVersion = '1.1.0'
+$ScriptVersion = '1.2.0'
 $SchemaVersion = 1
 $RunId         = $stamp
 $ConfigSource   = 'builtin'
 $ArchiveReport  = [bool]$Archive
 $AssessChannels = [bool]$AssessSystemChannels
+$SystemCleanEnabled = [bool]$SystemClean
 
 # ---------- 可选配置：只覆盖非安全关键参数 ----------
 # 配置缺失、解析失败或越界，一律回退内置默认值。
@@ -795,6 +799,100 @@ if ($Clean -and -not $script:abort) {
 }
 
 # ============================================================
+# 5b. 系统官方通道确认执行（-SystemClean，独立于 -Clean）
+# ============================================================
+# 白名单硬编码，不接受外部输入；每条单独确认；-DryRun 零执行。
+# 不进白名单：/ResetBase、删除 Windows.old、powercfg /h off、vssadmin delete shadows、任何第三方工具。
+$systemCleanWhitelist = @(
+    [pscustomobject]@{
+        id    = 'S01'
+        name  = '组件存储清理'
+        file  = 'Dism.exe'
+        args  = @('/Online', '/Cleanup-Image', '/StartComponentCleanup')
+        admin = $true
+        note  = '不带 /ResetBase；系统组件存储官方清理入口'
+    }
+)
+
+$systemCleanResults = @()
+if ($SystemCleanEnabled) {
+    Say ""
+    Say "[系统官方通道] 白名单 $($systemCleanWhitelist.Count) 条，逐条确认；演练模式零执行。" 'Cyan'
+    foreach ($sc in $systemCleanWhitelist) {
+        if ($script:abort) { break }
+        $r = [pscustomobject]@{
+            id           = $sc.id
+            name         = $sc.name
+            result       = 'skipped'
+            executed     = $false
+            exitCode     = $null
+            freeBeforeGB = 0
+            freeAfterGB  = 0
+            deltaGB      = 0
+            note         = ''
+        }
+        Say ""
+        Say ("[{0}] {1}" -f $sc.id, $sc.name) 'Cyan'
+        Say ("     命令：{0} {1}" -f $sc.file, ($sc.args -join ' ')) 'DarkGray'
+        if ($sc.note) { Say ("     " + $sc.note) 'DarkGray' }
+
+        if ($DryRun) {
+            Say "     [演练] 不询问、不执行任何命令" 'Magenta'
+            $r.result = 'dryrun'
+            Log ("SYSCH-DRYRUN {0}" -f $sc.id)
+            $systemCleanResults += $r
+            continue
+        }
+
+        $ans = Ask "确认执行这条系统命令？"
+        if ($ans -eq 'quit') { $script:abort = $true; Log ("SYSCH-QUIT {0}" -f $sc.id); break }
+        if ($ans -ne 'yes') { $r.result = 'skipped'; Log ("SYSCH-SKIP {0}" -f $sc.id); $systemCleanResults += $r; continue }
+        if ($sc.admin -and -not $isAdmin) {
+            $r.result = 'skipped'
+            $r.note = '需要管理员权限'
+            Say "     [跳过] 需要管理员权限" 'Yellow'
+            Log ("SYSCH-ADMIN {0}" -f $sc.id)
+            $systemCleanResults += $r
+            continue
+        }
+
+        $r.executed = $true
+        $r.freeBeforeGB = [math]::Round((GetFree) / 1GB, 3)
+        $scArgs = $sc.args
+        $null = & $sc.file @scArgs 2>&1
+        $r.exitCode = $LASTEXITCODE
+        $r.freeAfterGB = [math]::Round((GetFree) / 1GB, 3)
+        $r.deltaGB = [math]::Round($r.freeAfterGB - $r.freeBeforeGB, 3)
+        if ($r.exitCode -ne 0) {
+            $r.result = 'failed'
+            $r.note = '命令返回非零退出码'
+        } elseif ([math]::Abs($r.deltaGB) -lt 0.05) {
+            $r.result = 'unknown'
+            $r.note = '可用空间差值落在噪声带内，不判定释放量'
+        } else {
+            $r.result = 'ok'
+        }
+        $scColor = if ($r.result -eq 'ok') { 'Green' } else { 'Yellow' }
+        Say ("     退出码 {0}；可用空间 {1} -> {2} GB（差值 {3} GB）；判定 {4}" -f
+             $r.exitCode, $r.freeBeforeGB, $r.freeAfterGB, $r.deltaGB, $r.result) $scColor
+        if ($r.note) { Say ("     " + $r.note) 'DarkGray' }
+        Log ("SYSCH {0} result={1} exit={2} deltaGB={3}" -f $sc.id, $r.result, $r.exitCode, $r.deltaGB)
+        $systemCleanResults += $r
+    }
+
+    $scStatus = @()
+    $scStatus += "SYSTEM_CLEAN_COUNT=$($systemCleanWhitelist.Count)"
+    $scStatus += "SYSTEM_CLEAN_DRYRUN=$(if ($DryRun) { 1 } else { 0 })"
+    $scStatus += "SYSTEM_CLEAN_EXECUTED=$(@($systemCleanResults | Where-Object { $_.executed }).Count)"
+    foreach ($r in $systemCleanResults) {
+        $scStatus += "SYSTEM_CLEAN_ITEM=$($r.id):$($r.result):exit=$($r.exitCode):deltaGB=$($r.deltaGB)"
+    }
+    [System.IO.File]::AppendAllLines($statusPath, [string[]]$scStatus, (New-Object System.Text.UTF8Encoding($false)))
+    Say ""
+    Say (" 系统通道结果已追加到状态文件：{0}" -f $statusPath) 'DarkGray'
+}
+
+# ============================================================
 # 6. 个人文件：只列出，不删除
 # ============================================================
 if ($ListPersonalFiles -and -not $script:abort) {
@@ -859,7 +957,16 @@ if ($Clean) {
     [System.IO.File]::WriteAllLines($logFile, $script:logLines, (New-Object System.Text.UTF8Encoding($true)))
     Say ""
     Say (" 日志已保存：{0}" -f $logFile) 'DarkGray'
-} else {
+}
+
+if ($SystemCleanEnabled -and -not $Clean) {
+    $logFile = Join-Path $OutDir ("cleanup-log-{0}.txt" -f $stamp)
+    [System.IO.File]::WriteAllLines($logFile, $script:logLines, (New-Object System.Text.UTF8Encoding($true)))
+    Say ""
+    Say (" 系统通道日志已保存：{0}" -f $logFile) 'DarkGray'
+}
+
+if (-not $Clean -and -not $SystemCleanEnabled) {
     Say " 只读扫描完成，未做任何修改。" 'Green'
     Say " 如需清理，请以管理员身份运行：.\c_drive_tool.ps1 -Clean" 'Gray'
 }

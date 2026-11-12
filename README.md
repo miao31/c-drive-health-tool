@@ -149,6 +149,7 @@ cd "路径\cdrive-report"
 | `-ListPersonalFiles` | 开关 | 关 | 列出下载/桌面 ≥5 MB 的安装包及手动处理指引 |
 | `-Archive` | 开关 | 关 | 只读扫描结束时另存 `weekly-report-<yyyyMMdd>.md` |
 | `-AssessSystemChannels` | 开关 | 关 | 只读评估系统官方通道，报告追加第 11 节、状态文件追加评估标记 |
+| `-SystemClean` | 开关 | 关 | 进入系统官方通道确认执行；**独立于 `-Clean`**，每条命令单独询问 |
 | `-OutDir` | 字符串 | 脚本所在目录 | 报告输出目录 |
 | `-Config` | 字符串 | 空（不加载） | 可选配置文件的路径，见「版本、配置与演进」 |
 | `-DirTimeoutSec` | 整数 | `20` | 单个目录扫描超时（秒），超时即降级 |
@@ -188,7 +189,7 @@ cd "路径\cdrive-report"
 
 | 文件 | 产生时机 | 是否覆盖 | 说明 |
 |---|---|---|---|
-| `c_drive_analysis_report.md` | 每次运行 | **是**（每次覆盖）| Markdown 分析报告，10 个小节 |
+| `c_drive_analysis_report.md` | 每次运行 | **是**（每次覆盖）| Markdown 分析报告，10 个小节；带 `-AssessSystemChannels` 时追加第 11 节 |
 | `c_drive_scan_<时间戳>.json` | 每次运行 | 否 | 结构化扫描数据，含每项大小/文件数/Top 文件 |
 | `c_drive_scan_status_<时间戳>.txt` | 每次运行 | 否 | 机器可读的状态摘要（供自动化判断）|
 | `cleanup-log-<时间戳>.txt` | 仅清理模式 | 否 | 逐项确认与释放量日志，含 `DONE/SKIP` 记录 |
@@ -291,19 +292,25 @@ Copy-Item "路径\cdrive-report\c_drive_analysis_report.md" `
 | 版本 | 内容 |
 |---|---|
 | 1.1.0 | 阶段 A：版本与运行标识、可选配置、报告归档、追加式状态契约；阶段 B：`-AssessSystemChannels` 系统官方通道只读评估（报告第 11 节） |
+| 1.2.0 | 阶段 C1：`-SystemClean` 独立开关、硬编码命令白名单、逐条确认、执行前后可用空间实测、`-DryRun` 零执行、结果追加到状态文件 |
 
 > 1.1.0 之前的提交未使用版本号。从本版本起按阶段记录变更。
 > 本版本包含阶段 A 与阶段 B 两个阶段的合并改动；分阶段提交从下一阶段起执行。
 > 后续约定：每完成并验证一个阶段，提交一次 commit、推送一次，并打一个版本 tag。
 
-当前版本 `1.1.0`（脚本内 `$ScriptVersion`）。输出 JSON 与状态文件带 `toolVersion`、`schemaVersion`、`runId`、`configSource`、`runMode`、`scanSeconds`。
+当前版本 `1.2.0`（脚本内 `$ScriptVersion`）。输出 JSON 与状态文件带 `toolVersion`、`schemaVersion`、`runId`、`configSource`、`runMode`、`scanSeconds`。
 
 **状态文件是追加式契约**：`SCAN_DONE`、`HEALTH`、`LOW_SUM_GB`、`REPORT_OK` 等既有字段不变，只新增以下字段，现有自动化读取方式无需改动：
 
 ```
 TOOL_VERSION=<版本>   SCHEMA_VERSION=<整数>   RUN_ID=<时间戳>
 CONFIG_SOURCE=<来源>  RUN_MODE=<readonly|clean|clean-dryrun>   SCAN_SECONDS=<秒>
+SYSTEM_CLEAN_COUNT=<白名单条数>   SYSTEM_CLEAN_DRYRUN=<0|1>
+SYSTEM_CLEAN_EXECUTED=<实际执行条数>
+SYSTEM_CLEAN_ITEM=<id>:<结果>:exit=<退出码>:deltaGB=<差值>
 ```
+
+`SYSTEM_CLEAN_*` 只在带 `-SystemClean` 时追加，其余字段一字不改。
 
 ### 可选配置
 
@@ -313,7 +320,7 @@ CONFIG_SOURCE=<来源>  RUN_MODE=<readonly|clean|clean-dryrun>   SCAN_SECONDS=<�
 .\c_drive_tool.ps1 -Config .\tool.config.psd1
 ```
 
-只含 4 个非安全关键项：`DirTimeoutSec`、`TopFiles`、`TopSubdirs`、`ArchiveOnScan`。配置文件缺失、解析失败、数值越界时自动回退内置默认值，并在 `CONFIG_SOURCE` 标出原因。`$catalog`、`Guard-Path` 与删除逻辑**永不从配置读取**——配置化不等于把安全边界交出去。
+只含 5 个非安全关键项：`DirTimeoutSec`、`TopFiles`、`TopSubdirs`、`ArchiveOnScan`、`AssessSystemChannelsOnScan`。配置文件缺失、解析失败、数值越界时自动回退内置默认值，并在 `CONFIG_SOURCE` 标出原因。`$catalog`、`Guard-Path` 与删除逻辑**永不从配置读取**——配置化不等于把安全边界交出去。
 
 ### 报告归档
 
@@ -330,7 +337,30 @@ CONFIG_SOURCE=<来源>  RUN_MODE=<readonly|clean|clean-dryrun>   SCAN_SECONDS=<�
 - **占用 ≠ 可回收量**，本工具不估算、不伪造释放量；
 - 状态文件只在开关开启时追加 `SYSTEM_CHANNEL_COUNT` / `SYSTEM_CHANNEL_ASSESSED`，其余字段一字不改。
 
-阶段 C 的 `-SystemClean`（命令白名单 + 逐项确认执行）尚未实现；在此之前，官方命令需由用户按报告自行在管理员 PowerShell 中确认执行。
+### 系统官方通道确认执行（`-SystemClean`）
+
+`-SystemClean` 是**独立于 `-Clean`** 的开关，只处理系统官方通道，不碰 33 项目录清单。当前白名单硬编码 1 条，不接受外部输入：
+
+```
+Dism.exe /Online /Cleanup-Image /StartComponentCleanup
+```
+
+执行链路：
+
+1. 逐条显示命令与说明，单独询问 `Y/N/L/Q`（回车默认跳过）；
+2. 需要管理员权限的命令在普通权限下自动跳过，不报错中断；
+3. 执行前后各测一次 C 盘可用空间，差值即实测释放量；
+4. 退出码非零 → 记 `failed`；差值绝对值 < 0.05 GB → 记 `unknown`，**不判定释放量**；否则记 `ok`；
+5. 结果追加到状态文件，并写入 `cleanup-log-<时间戳>.txt`。
+
+严格边界：
+
+- **不进白名单**：`/ResetBase`、删除 `Windows.old`、`powercfg /h off`、`vssadmin delete shadows`、任何第三方工具；
+- `-SystemClean -DryRun` **零执行**：不询问、不启动任何外部进程，只验证链路并写状态字段；
+- 白名单不接受配置文件或命令行传入；`-SystemClean` 也不会写进配置文件，避免无人值守触发；
+- 两层安全边界不变：默认只读、逐项确认、33 项分级与 `Guard-Path` 一律不动。
+
+> 真实执行（`Dism` 会修改组件存储且不可撤销）需要**管理员权限**并由你逐条按 `Y`。本工具的演练模式可用于先确认链路，实际执行请自行判断时机。
 
 ### 定位与演进方向
 
@@ -341,7 +371,7 @@ CONFIG_SOURCE=<来源>  RUN_MODE=<readonly|clean|clean-dryrun>   SCAN_SECONDS=<�
 1. **交互层** —— 默认只读、`-Clean` 才进入清理、逐项 `Y/N/L/Q` 确认、回车默认跳过、`-DryRun` 演练。
 2. **目录层** —— 33 项固化清单与三级风险分级不放松，`protected` / `confirm` 不转可清理，Guard-Path 与降级禁止清理保持不变。
 
-因此空间增量优先从**系统官方通道**取得（DISM 组件存储清理、cleanmgr、存储感知），由用户逐项确认后执行，而不是靠放宽目录分级。路线：规范化地基 ✅ → 官方通道只读评估 ✅（`-AssessSystemChannels`）→ 官方通道确认执行（下一步，阶段 C）→ 覆盖与只读报告增强 → 模块化 → 独立软件 → 商用预留。图形界面与降低确认摩擦在守住两层底线的前提下可以评估，**不预先排除**。
+因此空间增量优先从**系统官方通道**取得（DISM 组件存储清理、cleanmgr、存储感知），由用户逐项确认后执行，而不是靠放宽目录分级。路线：规范化地基 ✅ → 官方通道只读评估 ✅（`-AssessSystemChannels`）→ 官方通道确认执行 ✅（`-SystemClean` 链路，C1）→ 覆盖与只读报告增强 → 模块化 → 独立软件 → 商用预留。图形界面与降低确认摩擦在守住两层底线的前提下可以评估，**不预先排除**。
 
 ---
 
