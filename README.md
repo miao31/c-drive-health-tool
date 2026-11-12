@@ -331,7 +331,13 @@ SYSTEM_CLEAN_ITEM=<id>:<结果>:exit=<退出码>:deltaGB=<差值>
 
 两次失败的空间变化方向相反（-937.6 MB 与 +54.3 MB），幅度都超过 `0.05 GB` 阈值，退出码却都是 5。所以差值必须在退出码为 0 之后才参与判定：即使差值为正且越过噪声带，命令失败时也不能当作释放量。当前判定顺序为 `740 → 5 → 其它非 0 → 负差值 → 噪声 → ok`，已满足这一点。
 
-> 噪声阈值 `0.05 GB` 尚未经成功清理案例校准：两次执行退出码都非零，差值分支没有走到。第二次的 +54.3 MB 是失败命令产生的空间波动，不是释放量。保持该值直至有成功样本。
+**第一次成功清理（2026-11-12 18:00）**：在系统侧修复组件存储后重试，`SYSTEM_CLEAN_PRECHECK=admin=1;exe=1;canRun=1`、`EXECUTED=1`、退出码 `0`、`result=ok`、`RUN_MODE=system-clean`。三个独立测源一致记录可用空间**净增 5283.8 MB（5.16 GiB）**，工具自报 `deltaGB=5.395`（`freeBeforeGB=82.597` → `freeAfterGB=87.992`）。CBS 日志收尾为 `Session ... finalized [HRESULT = 0x00000000 - S_OK]`、`Reboot required: no, RepairNeeded: no`。
+
+**两个差值的口径**：独立测源测的是整次运行前后，工具测的是该命令执行前后。工具的前测发生在约 76 秒扫描之后，期间后台活动消耗约 241 MB，所以两个差值相差 240.7 MB；两者的后测一致（差 0.45 MB，来自舍入）。不是计算错误，是测量窗口不同。
+
+**噪声阈值 `0.05 GB` 已校准，保持原值**：成功样本净增是阈值（51.2 MiB）的 103 倍，不会漏报；两次失败样本的空间波动最大为 +54.3 MiB，仅越过阈值 3.1 MiB，但都在退出码非零时被门禁拦截，不进入差值分支。阈值只判断差值幅度是否可分辨，不用于判定命令成败；成败由退出码决定。上调会漏掉小的真实释放，下调会让噪声更易越过，故维持原值。
+
+> 遗留边界：DISM 返回退出码 0 后，CBS 后台 scavenge 仍持续约 306 秒，期间可用空间继续变化。需要精确释放量时，应在后台活动结束后再补测一次。
 
 **E_ACCESSDENIED 是什么、怎么重试**：这是 Windows 组件存储的事务提交失败，**不是本工具权限不足**（会话已是管理员，`SYSTEM_CLEAN_PRECHECK=admin=1;exe=1;canRun=1`）。本机后续只读检查：目标 `.cat` 文件仍存在、所有者 `NT SERVICE\TrustedInstaller`、Administrators 仅 `ReadAndExecute`；`SessionsPending` 有残留会话键但 `Exclusive=0`；`RebootPending=false`、`pending.xml` 不存在、无并发 DISM/TiWorker 进程；系统为 26H2 build 26300.9974，卷 `Healthy`。
 
